@@ -1,292 +1,136 @@
 """
-Streamlit YouTube Transcription + RAG Chat (Groq)
-- Expects GROQ_API_KEY in environment (and optional GROQ_MODEL)
-- Uses youtube-transcript-api to fetch transcripts (no YouTube Data API key required).
-- Uses TF-IDF + cosine similarity to pick relevant chunks, then calls Groq Chat Completions.
+Streamlit YouTube Transcript + Groq RAG Chat (Fixed Version)
+- Works with latest youtube-transcript-api
 """
 
 import os
 import re
 import json
-import time
 import requests
-from typing import List, Tuple
-
 import streamlit as st
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
 
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# ----------------------------
-# Configuration / Defaults
-# ----------------------------
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    # We'll still let the app run, but API calls will fail until the key is set.
-    pass
+# --- CONFIG ---
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "groq/llama3-8b-8192")  # any available model
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "groq/compound-mini")
-GROQ_CHAT_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 200
 
-# Chunking parameters
-CHUNK_SIZE = 900    # characters per chunk
-CHUNK_OVERLAP = 200  # overlap characters
 
-# ----------------------------
-# Helpers
-# ----------------------------
-
+# --- UTILITIES ---
 def extract_video_id(url: str) -> str:
-    """
-    Get YouTube video id from a variety of URL formats.
-    """
-    # Common patterns
-    patterns = [
-        r"(?:v=|\/v\/|youtu\.be\/|\/embed\/)([A-Za-z0-9_-]{10,})",
-        r"([A-Za-z0-9_-]{11})"  # fallback - 11 char id
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-    raise ValueError("Could not extract video id from the URL. Provide a full YouTube URL.")
+    """Extract the 11-char YouTube video ID."""
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
+    if not match:
+        raise ValueError("Invalid YouTube URL")
+    return match.group(1)
 
-def fetch_transcript(video_id: str, languages=None) -> List[dict]:
-    """
-    Fetch transcript using youtube-transcript-api.
-    Returns a list of {'text':..., 'start':..., 'duration':...}
-    """
+
+def fetch_transcript(video_id: str) -> str:
+    """Fetch transcript safely using latest API."""
     try:
-        if languages:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
-        else:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        return transcript_list
+        transcript_obj = YouTubeTranscriptApi.list_transcripts(video_id)
+        # Try English first, then fallback to first available
+        try:
+            transcript = transcript_obj.find_transcript(['en']).fetch()
+        except Exception:
+            transcript = transcript_obj.find_transcript(transcript_obj._manually_created_transcripts.keys()).fetch()
+        text = " ".join(seg['text'] for seg in transcript)
+        return text
     except VideoUnavailable:
-        raise RuntimeError("Video is unavailable.")
+        raise RuntimeError("Video unavailable.")
     except TranscriptsDisabled:
-        raise RuntimeError("Transcripts are disabled for this video.")
+        raise RuntimeError("Transcripts disabled for this video.")
     except NoTranscriptFound:
-        raise RuntimeError("No transcript found for this video.")
+        raise RuntimeError("No transcript found.")
     except Exception as e:
         raise RuntimeError(f"Transcript fetch error: {e}")
 
-def transcript_to_text(transcript: List[dict]) -> str:
-    """
-    Convert the list-of-segments to a single text string.
-    """
-    return " ".join(seg.get("text", "").strip() for seg in transcript).strip()
 
-def chunk_text(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[str]:
-    """
-    Chunk text into overlapping chunks for retrieval.
-    """
-    if not text:
-        return []
-    chunks = []
-    start = 0
+def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Split text into overlapping chunks."""
+    chunks, start = [], 0
     while start < len(text):
         end = start + size
-        chunk = text[start:end]
-        chunks.append(chunk.strip())
+        chunks.append(text[start:end])
         start = end - overlap
-        if start < 0:
-            start = 0
     return chunks
 
-def build_tfidf_index(chunks: List[str]):
-    """
-    Fit a TF-IDF vectorizer on chunks and return (vectorizer, vectors).
-    """
-    vectorizer = TfidfVectorizer(strip_accents="unicode", stop_words="english")
-    vectors = vectorizer.fit_transform(chunks) if chunks else None
-    return vectorizer, vectors
 
-def retrieve_top_chunks(question: str, chunks: List[str], vectorizer, vectors, top_k=4) -> List[Tuple[int, str]]:
-    """
-    Return top_k (index, chunk) most relevant to question by cosine similarity.
-    """
-    if not chunks:
-        return []
+def build_tfidf(chunks):
+    vectorizer = TfidfVectorizer(stop_words="english")
+    X = vectorizer.fit_transform(chunks)
+    return vectorizer, X
+
+
+def retrieve_chunks(question, chunks, vectorizer, X, k=4):
     q_vec = vectorizer.transform([question])
-    sims = cosine_similarity(q_vec, vectors)[0]  # shape (n_chunks,)
-    top_idx = sims.argsort()[::-1][:top_k]
-    results = [(int(i), chunks[i]) for i in top_idx if sims[i] > 0]
-    return results
+    sims = cosine_similarity(q_vec, X)[0]
+    top_idx = sims.argsort()[::-1][:k]
+    return [chunks[i] for i in top_idx]
 
-def call_groq_chat(question: str, selected_chunks: List[Tuple[int, str]], api_key: str, model: str = GROQ_MODEL, max_tokens: int = 512):
-    """
-    Call Groq Chat Completions (OpenAI-compatible endpoint).
-    We pass the selected transcript chunks as 'documents' to the API (simple RAG).
-    """
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY not set. Set environment variable GROQ_API_KEY before using the Groq API.")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    # Build documents array from chunks (document id + text)
-    documents = [{"id": str(i), "text": text} for i, text in selected_chunks]
-
-    system_message = (
-        "You are a helpful assistant. Use ONLY the provided documents (transcript snippets) to answer user questions about the video. "
-        "If the answer is not contained in the documents, say you don't know and suggest looking at the video."
-    )
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": question}
-        ],
-        # Groq supports 'documents' (per API reference) to pass context for RAG-like usage.
-        "documents": documents,
-        "max_output_tokens": max_tokens,
-        "temperature": 0.12,
-    }
-
-    resp = requests.post(GROQ_CHAT_ENDPOINT, headers=headers, json=payload, timeout=60)
-    if resp.status_code != 200:
-        # Try to extract error
-        try:
-            err = resp.json()
-        except Exception:
-            err = resp.text
-        raise RuntimeError(f"Groq API error {resp.status_code}: {err}")
-
-    data = resp.json()
-    # Groq's OpenAI-compatible response object is similar: check choices / message
-    # Different Groq SDKs return slightly different wrappers; attempt common patterns:
-    # Try "choices"[0]["message"]["content"] or "choices"[0]["text"] or top-level "text"
-    try:
-        if "choices" in data and len(data["choices"]) > 0:
-            choice = data["choices"][0]
-            # OpenAI-like
-            if "message" in choice and "content" in choice["message"]:
-                return choice["message"]["content"]
-            if "text" in choice:
-                return choice["text"]
-        # fallback: some Groq endpoints might return top-level fields
-        if "text" in data:
-            return data["text"]
-        # fallback: try 'output_text' (Responses API)
-        if "output_text" in data:
-            return data["output_text"]
-    except Exception:
-        pass
-
-    # If nothing matched, return full JSON
-    return json.dumps(data, indent=2)
-
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-st.set_page_config(page_title="YouTube → Transcript + RAG (Groq)", layout="wide")
-st.title("YouTube Transcript + Q&A (Streamlit + Groq RAG)")
-
-st.markdown(
-    """
-Enter a **YouTube video URL**, click **Get Transcript**.  
-Then ask questions about the video — the app will retrieve the most relevant transcript chunks and query Groq (RAG).
-"""
-)
-
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    video_url = st.text_input("YouTube video URL", placeholder="https://www.youtube.com/watch?v=...")
-    get_button = st.button("Get Transcript")
-
-with col2:
-    st.write("Groq settings")
-    st.text("Model (env GROQ_MODEL):")
-    st.code(GROQ_MODEL)
-    st.write("Make sure GROQ_API_KEY is set in environment.")
+def call_groq(question, context_chunks):
     if not GROQ_API_KEY:
-        st.error("GROQ_API_KEY is not set. Set it as an environment variable before asking questions to Groq.")
+        raise RuntimeError("Missing GROQ_API_KEY in environment.")
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    docs = [{"id": str(i), "text": c} for i, c in enumerate(context_chunks)]
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "Answer the user's question using only the provided transcript."},
+            {"role": "user", "content": question},
+        ],
+        "documents": docs,
+        "max_output_tokens": 512,
+    }
+    r = requests.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=60)
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
 
-# Session caching of transcript + index
-if "transcript_text" not in st.session_state:
-    st.session_state["transcript_text"] = ""
-if "chunks" not in st.session_state:
-    st.session_state["chunks"] = []
-if "vectorizer" not in st.session_state:
-    st.session_state["vectorizer"] = None
-if "vectors" not in st.session_state:
-    st.session_state["vectors"] = None
-if "video_id" not in st.session_state:
-    st.session_state["video_id"] = None
 
-if get_button and video_url:
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="🎬 YouTube Transcript Chat", layout="wide")
+st.title("🎥 YouTube Transcript + Groq Chat (RAG)")
+
+url = st.text_input("Enter YouTube Video URL:", placeholder="https://www.youtube.com/watch?v=example")
+if st.button("Get Transcript"):
     try:
-        vid = extract_video_id(video_url)
-        st.session_state["video_id"] = vid
+        vid = extract_video_id(url)
         with st.spinner("Fetching transcript..."):
-            segments = fetch_transcript(vid)
-            text = transcript_to_text(segments)
-            st.session_state["transcript_text"] = text
-            chunks = chunk_text(text)
-            st.session_state["chunks"] = chunks
-            vect, vecs = build_tfidf_index(chunks)
-            st.session_state["vectorizer"] = vect
-            st.session_state["vectors"] = vecs
-        st.success("Transcript fetched and indexed.")
+            transcript = fetch_transcript(vid)
+            st.session_state['transcript'] = transcript
+            chunks = chunk_text(transcript)
+            vect, X = build_tfidf(chunks)
+            st.session_state['chunks'] = chunks
+            st.session_state['vect'] = vect
+            st.session_state['X'] = X
+        st.success("✅ Transcript fetched successfully!")
     except Exception as e:
-        st.error(f"Could not fetch transcript: {e}")
+        st.error(str(e))
 
-# Show transcript preview
-with st.expander("Transcript (preview)"):
-    if st.session_state["transcript_text"]:
-        st.write(st.session_state["transcript_text"][:5000] + ("..." if len(st.session_state["transcript_text"])>5000 else ""))
-        if st.button("Show full transcript"):
-            st.write(st.session_state["transcript_text"])
-    else:
-        st.info("No transcript yet. Enter a YouTube URL and click 'Get Transcript'.")
+if 'transcript' in st.session_state:
+    with st.expander("View Transcript"):
+        st.write(st.session_state['transcript'][:4000] + "...")
 
-# Q&A UI
 st.markdown("---")
-st.header("Ask questions about the video")
-question = st.text_input("Your question about the video")
-ask = st.button("Ask Groq")
+st.subheader("💬 Ask Questions About the Video")
 
-if ask:
-    if not st.session_state["transcript_text"]:
-        st.warning("Please fetch a transcript first.")
-    elif not question.strip():
-        st.warning("Type a question.")
-    else:
-        with st.spinner("Retrieving relevant chunks..."):
-            chunks = st.session_state["chunks"]
-            vect = st.session_state["vectorizer"]
-            vecs = st.session_state["vectors"]
-            selected = retrieve_top_chunks(question, chunks, vect, vecs, top_k=5)
-            # If similarity returned nothing, fall back to top sequential chunks
-            if not selected:
-                selected = list(enumerate(chunks[:5]))
-        # Show what we will send as context
-        st.subheader("Context provided to the model (top chunks)")
-        for idx, chunk in selected:
-            st.text_area(f"chunk {idx}", value=chunk[:2000], height=120)
+question = st.text_input("Your Question:")
+if st.button("Ask Groq"):
+    try:
+        with st.spinner("Retrieving answer..."):
+            rel_chunks = retrieve_chunks(question, st.session_state['chunks'], st.session_state['vect'], st.session_state['X'])
+            answer = call_groq(question, rel_chunks)
+        st.success("### Answer:")
+        st.write(answer)
+    except Exception as e:
+        st.error(f"Error: {e}")
 
-        # Call Groq
-        try:
-            with st.spinner("Calling Groq..."):
-                answer = call_groq_chat(question, selected, api_key=GROQ_API_KEY, model=GROQ_MODEL)
-            st.subheader("Answer")
-            st.write(answer)
-        except Exception as e:
-            st.error(f"Groq call failed: {e}")
-
-# Footer / credits
 st.markdown("---")
-st.markdown(
-    """
-**Notes**
-- Transcript is fetched with the `youtube-transcript-api` package (auto-generated or uploaded captions). Accuracy depends on YouTube captions.  
-- This app uses a simple TF-IDF retrieval for RAG; for production, consider embeddings + vector DB for better recall.  
-- Set `GROQ_API_KEY` (and optionally `GROQ_MODEL`) in your environment before using the Groq integration.
-"""
-)
+st.caption("Built with ❤️ using Streamlit + Groq API + youtube-transcript-api")
