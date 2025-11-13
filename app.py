@@ -32,16 +32,20 @@ def extract_video_id(url: str) -> str:
 
 
 def fetch_transcript(video_id: str) -> str:
-    """Fetch transcript safely using latest API."""
+    """Fetch transcript; supports both new and old youtube-transcript-api versions."""
     try:
-        transcript_obj = YouTubeTranscriptApi.list_transcripts(video_id)
-        # Try English first, then fallback to first available
-        try:
-            transcript = transcript_obj.find_transcript(['en']).fetch()
-        except Exception:
-            transcript = transcript_obj.find_transcript(transcript_obj._manually_created_transcripts.keys()).fetch()
-        text = " ".join(seg['text'] for seg in transcript)
-        return text
+        # prefer modern API
+        if hasattr(YouTubeTranscriptApi, "list_transcripts"):
+            list_obj = YouTubeTranscriptApi.list_transcripts(video_id)
+            try:
+                transcript = list_obj.find_transcript(['en']).fetch()
+            except Exception:
+                transcript = list(list_obj._manually_created_transcripts.values())[0].fetch()
+        else:
+            # fallback for legacy versions
+            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+
+        return " ".join(seg['text'] for seg in transcript)
     except VideoUnavailable:
         raise RuntimeError("Video unavailable.")
     except TranscriptsDisabled:
@@ -50,6 +54,7 @@ def fetch_transcript(video_id: str) -> str:
         raise RuntimeError("No transcript found.")
     except Exception as e:
         raise RuntimeError(f"Transcript fetch error: {e}")
+
 
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
