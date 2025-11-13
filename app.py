@@ -275,7 +275,7 @@ def call_groq_chat(question: str, selected_chunks: List[Tuple[int, str]]):
 # Streamlit UI
 # -------------------------
 st.set_page_config(page_title="YouTube → Transcript + RAG (yt-dlp)", layout="wide")
-st.title("YouTube Transcript + Q&A — robust (yt-dlp)")
+st.title("YouTube Transcript + Q&A using RAG (by Engr. Bilal)")
 
 st.markdown(
     """
